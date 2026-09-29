@@ -1,12 +1,16 @@
-# API key — never commit this
+# API keys — never commit this
 .env
 
 # Saved capture region (machine-specific)
 region.json
 
-# Python cache
+# Virtual environment
+.venv/
+
+# Python / test caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
 # VS Code local settings
 .vscode/settings.json

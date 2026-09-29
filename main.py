@@ -1,24 +1,42 @@
-import tkinter as tk
-from tkinter import messagebox
-import json
-import os
-import sys
+"""Whatnot Pricer entry point: load settings, pick the stream region, then run
+the overlay window and the capture thread."""
 
-CONFIG_FILE = "region.json"
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+APP_DIR = Path(__file__).resolve().parent
+ENV_FILE = APP_DIR / ".env"
+REGION_FILE = APP_DIR / "region.json"
+REGION_KEYS = ("left", "top", "width", "height")
+MIN_REGION_SIZE = 50  # px; smaller drags are ignored
+
+log = logging.getLogger("whatnot_pricer")
 
 
 class RegionSelector:
-    def __init__(self):
-        self.region = None
-        self._start_x = None
-        self._start_y = None
+    """Full-screen, dimmed screenshot of the primary monitor to drag a box on."""
+
+    def __init__(self) -> None:
+        self.region: dict[str, int] | None = None
+        self._start_x: int | None = None
+        self._start_y: int | None = None
         self._rect = None
 
-    def select(self):
+    def select(self) -> dict[str, int] | None:
+        import tkinter as tk
+
         import mss
         from PIL import Image, ImageTk
 
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             mon = sct.monitors[1]  # Primary monitor
             shot = sct.grab(mon)
             img = Image.frombytes("RGB", shot.size, shot.rgb)
@@ -69,7 +87,7 @@ class RegionSelector:
                 return
             x1, x2 = sorted([sel._start_x, e.x])
             y1, y2 = sorted([sel._start_y, e.y])
-            if x2 - x1 > 50 and y2 - y1 > 50:
+            if x2 - x1 > MIN_REGION_SIZE and y2 - y1 > MIN_REGION_SIZE:
                 sel.region = {
                     "left": x1 + offset_x,
                     "top": y1 + offset_y,
@@ -89,52 +107,108 @@ class RegionSelector:
         return self.region
 
 
-def main():
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror(
-            "Missing API Key",
-            "Set the ANTHROPIC_API_KEY environment variable and restart.\n\n"
-            "Example (PowerShell):\n$env:ANTHROPIC_API_KEY = 'sk-ant-...'",
-        )
+# ================================================================== settings
+
+def load_env(env_file: Path = ENV_FILE) -> None:
+    """Load .env from the project folder. Variables already set in the
+    environment take precedence over the file."""
+    load_dotenv(env_file, override=False)
+
+
+def load_region(path: Path = REGION_FILE) -> dict[str, int] | None:
+    """Saved capture region, or None if the file is missing or invalid."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        region = {key: int(data[key]) for key in REGION_KEYS}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        log.warning("Ignoring invalid %s (%s)", path.name, exc)
+        return None
+    if region["width"] < MIN_REGION_SIZE or region["height"] < MIN_REGION_SIZE:
+        log.warning("Ignoring %s: region is too small", path.name)
+        return None
+    return region
+
+
+def save_region(region: dict[str, int], path: Path = REGION_FILE) -> None:
+    path.write_text(json.dumps(region), encoding="utf-8")
+
+
+def restart_with_new_region() -> None:
+    """Forget the saved region and relaunch, so the selector shows again."""
+    REGION_FILE.unlink(missing_ok=True)
+    subprocess.Popen([sys.executable, str(APP_DIR / "main.py")], cwd=APP_DIR)
+
+
+def show_missing_key_error() -> None:
+    import tkinter as tk
+    from tkinter import messagebox
+
+    message = (
+        "ANTHROPIC_API_KEY is not set.\n\n"
+        f"Create a .env file in {APP_DIR} containing:\n"
+        "ANTHROPIC_API_KEY=sk-ant-...\n\n"
+        "or set it in your shell, e.g. (PowerShell):\n"
+        "$env:ANTHROPIC_API_KEY = 'sk-ant-...'"
+    )
+    log.error("ANTHROPIC_API_KEY is not set (see README: create a .env file)")
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showerror("Missing API Key", message)
+    root.destroy()
+
+
+# ====================================================================== main
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    load_env()
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        show_missing_key_error()
         sys.exit(1)
 
-    region = None
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as f:
-                region = json.load(f)
-            print(f"Loaded saved region: {region}")
-        except Exception:
-            pass
+    import tkinter as tk
 
-    if region is None:
-        print("Select the stream region on screen...")
-        sel = RegionSelector()
-        region = sel.select()
-        if not region:
-            print("No region selected — exiting.")
-            sys.exit(0)
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(region, f)
-        print(f"Region saved: {region}")
-
-    from overlay import OverlayWindow
     from monitor import Monitor
+    from overlay import OverlayWindow
+
+    region = load_region()
+    if region:
+        log.info("Loaded saved region: %s", region)
+    else:
+        log.info("Select the stream region on screen...")
+        region = RegionSelector().select()
+        if not region:
+            log.info("No region selected, exiting.")
+            sys.exit(0)
+        save_region(region)
+        log.info("Region saved: %s", region)
 
     root = tk.Tk()
     root.withdraw()
 
-    overlay = OverlayWindow(root)
+    overlay = OverlayWindow(root, on_reset=restart_with_new_region)
+
+    def post(callback) -> None:
+        """Run callback on the Tk thread; ignore it once the window is gone."""
+        try:
+            root.after(0, callback)
+        except (RuntimeError, tk.TclError):
+            pass
 
     def on_result(card_data, price_data):
-        root.after(0, lambda: overlay.update_card(card_data, price_data))
+        post(lambda: overlay.update_card(card_data, price_data))
 
     def on_status(msg):
-        root.after(0, lambda: overlay.set_status(msg))
+        post(lambda: overlay.set_status(msg))
 
     monitor = Monitor(region, on_result, on_status)
+    log.info("Using model %s", monitor.model)
     overlay.monitor = monitor
     overlay.show_region_border(region)
     monitor.start()
